@@ -1,0 +1,88 @@
+plugins {
+    id 'java'
+}
+
+group = 'io.universl'
+version = '1.0.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+// There is intentionally no com.android.application/library plugin: no APK or AAR.
+// Java sources remain platform-independent; Android's D8 supplies the DEX backend.
+def sdkDirectory = providers.provider {
+    def local = new Properties()
+    def propertiesFile = rootProject.file('local.properties')
+    if (propertiesFile.isFile()) {
+        propertiesFile.withInputStream { local.load(it) }
+    }
+    def path = providers.gradleProperty('androidSdkDir').orNull ?:
+            local.getProperty('sdk.dir') ?:
+            System.getenv('ANDROID_SDK_ROOT') ?: System.getenv('ANDROID_HOME')
+    if (!path) {
+        throw new GradleException('Android SDK not found. Set sdk.dir in local.properties, ANDROID_SDK_ROOT, or -PandroidSdkDir=/path/to/sdk')
+    }
+    return rootProject.file(path)
+}
+def buildToolsVersion = providers.gradleProperty('androidBuildToolsVersion').get()
+def minSdk = providers.gradleProperty('androidMinSdk').get()
+def d8Jar = sdkDirectory.map { new File(it, "build-tools/${buildToolsVersion}/lib/d8.jar") }
+def dexDirectory = layout.buildDirectory.dir('dex')
+def jniDirectory = layout.buildDirectory.dir('jni')
+
+tasks.named('compileJava', JavaCompile) {
+    options.release = 8
+    options.encoding = 'UTF-8'
+    options.headerOutputDirectory = jniDirectory
+}
+tasks.named('compileTestJava', JavaCompile) {
+    options.release = 8
+    options.encoding = 'UTF-8'
+}
+
+// The bridge tests use a fake native backend, with no Android device or JNI library.
+tasks.register('bridgeTest', JavaExec) {
+    group = 'verification'
+    description = 'Run standalone JVM bridge contract tests.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'io.universl.touch.TouchDexTest'
+}
+tasks.named('check') { dependsOn tasks.named('bridgeTest') }
+
+tasks.register('dex', JavaExec) {
+    group = 'build'
+    description = 'Compile Java classes directly to build/dex/classes.dex (no APK).'
+    dependsOn tasks.named('classes')
+    mainClass = 'com.android.tools.r8.D8'
+    classpath = files(d8Jar)
+    inputs.files(sourceSets.main.output.classesDirs)
+    inputs.file(d8Jar)
+    inputs.property('minSdk', minSdk)
+    outputs.dir(dexDirectory)
+    doFirst {
+        if (!d8Jar.get().isFile()) {
+            throw new GradleException("D8 not found: ${d8Jar.get()}. Install SDK build-tools;${buildToolsVersion}")
+        }
+        def output = dexDirectory.get().asFile
+        delete(output)
+        output.mkdirs()
+        def classFiles = sourceSets.main.output.classesDirs.asFileTree.matching {
+            include '**/*.class'
+        }.files.sort { it.path }
+        setArgs(['--release', '--min-api', minSdk, '--output', output.absolutePath] +
+                classFiles.collect { it.absolutePath })
+    }
+    doLast {
+        def dexFile = new File(dexDirectory.get().asFile, 'classes.dex')
+        if (!dexFile.isFile()) throw new GradleException('D8 did not produce classes.dex')
+        logger.lifecycle("DEX: ${dexFile}")
+    }
+}
+
+// Even the standard assemble/build lifecycle never packages a Java JAR or APK.
+tasks.named('jar') { enabled = false }
+tasks.named('assemble') { dependsOn tasks.named('dex') }
